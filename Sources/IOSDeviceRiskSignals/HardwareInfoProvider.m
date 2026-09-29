@@ -1,0 +1,155 @@
+#import "HardwareInfoProvider.h"
+#import "CollectionThreadPolicy.h"
+#import <CommonCrypto/CommonCrypto.h>
+#import <UIKit/UIKit.h>
+#import <mach/mach.h>
+#import <os/lock.h>
+
+// UIDevice.batteryMonitoringEnabled is process-global state that this probe mutates and restores.
+// The module now runs its probes on a concurrent queue (see -methodQueue in DeviceIntel.mm), so two
+// overlapping reads could otherwise interleave save and restore and leave monitoring permanently
+// enabled in the host app — exactly the side effect the comment below promises not to leave.
+// A process-wide lock makes that invariant local to the code that owns it instead of an incidental
+// side effect of the main-queue hop, which a separate decision is free to remove. The section is a
+// few UIKit property reads, is never entered recursively, and is only ever reached from the main
+// queue, so it cannot deadlock and is uncontended in practice.
+static os_unfair_lock sBatteryMonitoringLock = OS_UNFAIR_LOCK_INIT;
+
+@implementation HardwareInfoProvider
+
+- (NSDictionary *)hardwareSignals
+{
+  RNDIRequireMainThread();
+  NSMutableDictionary *result = [NSMutableDictionary dictionary];
+
+  // CPU + total RAM — thread-safe, not a Required-Reason API.
+  NSProcessInfo *processInfo = [NSProcessInfo processInfo];
+  result[@"processorCount"] = @(processInfo.processorCount);
+  result[@"totalMemoryBytes"] = @(processInfo.physicalMemory);
+  result[@"lowPowerModeEnabled"] = @(processInfo.lowPowerModeEnabled);
+  int64_t freeMemory = [self freeMemoryBytes];
+  if (freeMemory > 0) {
+    result[@"freeMemoryBytes"] = @(freeMemory);
+  }
+  int64_t residentMemory = [self processResidentMemoryBytes];
+  if (residentMemory > 0) {
+    result[@"processResidentMemoryBytes"] = @(residentMemory);
+  }
+
+  // UIScreen and UIDevice are both NS_SWIFT_UI_ACTOR in the SDK, so they must be touched on the
+  // main thread; the caller owns dispatch. UIFont is NS_SWIFT_SENDABLE and is read
+  // directly in fontsFingerprint below.
+  void (^work)(void) = ^{
+    UIScreen *screen = [UIScreen mainScreen];
+    CGRect bounds = screen.bounds;
+    CGFloat scale = screen.scale;
+    result[@"screenWidthPx"] = @((NSInteger)(bounds.size.width * scale));
+    result[@"screenHeightPx"] = @((NSInteger)(bounds.size.height * scale));
+    result[@"screenDensity"] = @(scale);
+
+    CGRect native = screen.nativeBounds; // already in physical pixels
+    result[@"screenPhysicalWidthPx"] = @((NSInteger)native.size.width);
+    result[@"screenPhysicalHeightPx"] = @((NSInteger)native.size.height);
+    result[@"screenPhysicalDensity"] = @(screen.nativeScale);
+    result[@"screenBrightness"] = @(screen.brightness);
+
+    UIDevice *device = [UIDevice currentDevice];
+    // UIDevice is a process-wide singleton; enabling battery monitoring is required to read the level/
+    // state but is global state — save and restore it so this passive probe leaves no side effect.
+    // The whole save/enable/read/restore sequence is one critical section: see sBatteryMonitoringLock.
+    os_unfair_lock_lock(&sBatteryMonitoringLock);
+    BOOL previousBatteryMonitoring = device.batteryMonitoringEnabled;
+    device.batteryMonitoringEnabled = YES;
+    float level = device.batteryLevel; // -1 when unknown
+    UIDeviceBatteryState state = device.batteryState;
+    device.batteryMonitoringEnabled = previousBatteryMonitoring;
+    os_unfair_lock_unlock(&sBatteryMonitoringLock);
+    if (level >= 0) {
+      result[@"batteryLevel"] = @(level);
+    }
+    result[@"batteryState"] = [self batteryStateString:state];
+  };
+  work();
+
+  return result;
+}
+
+// fonts — split out of hardwareSignals into its own probe (isolated, generous timeout on the JS side).
+// No main-thread hop: UIFont is declared NS_SWIFT_SENDABLE in the SDK and neither +familyNames nor
+// +fontNamesForFamilyName: is main-actor isolated, unlike UIScreen and UIDevice which are both
+// NS_SWIFT_UI_ACTOR. Enumerating the system font table is the most expensive read in this file, so
+// holding the main thread for it cost the host application for no reason.
+- (NSDictionary *)fontsFingerprint
+{
+  NSString *digest = [self fontsDigest];
+  return digest ? @{@"fontsDigest" : digest} : @{};
+}
+
+- (int64_t)freeMemoryBytes
+{
+  // mach_host_self() adds a send right to our IPC space on every call — it MUST be balanced with
+  // mach_port_deallocate (unlike mach_task_self(), which is cached and must not be deallocated).
+  // Single exit path so the port is released exactly once regardless of which read fails.
+  mach_port_t host = mach_host_self();
+  int64_t freeBytes = -1;
+  vm_size_t pageSize = 0;
+  if (host_page_size(host, &pageSize) == KERN_SUCCESS) {
+    vm_statistics64_data_t stats;
+    mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
+    if (host_statistics64(host, HOST_VM_INFO64, (host_info64_t)&stats, &count) == KERN_SUCCESS) {
+      freeBytes = (int64_t)stats.free_count * (int64_t)pageSize;
+    }
+  }
+  mach_port_deallocate(mach_task_self(), host);
+  return freeBytes;
+}
+
+- (int64_t)processResidentMemoryBytes
+{
+  mach_task_basic_info_data_t info;
+  mach_msg_type_number_t count = MACH_TASK_BASIC_INFO_COUNT;
+  kern_return_t status = task_info(
+    mach_task_self(),
+    MACH_TASK_BASIC_INFO,
+    (task_info_t)&info,
+    &count
+  );
+  return status == KERN_SUCCESS ? (int64_t)info.resident_size : -1;
+}
+
+- (NSString *)batteryStateString:(UIDeviceBatteryState)state
+{
+  switch (state) {
+    case UIDeviceBatteryStateCharging:
+      return @"charging";
+    case UIDeviceBatteryStateFull:
+      return @"full";
+    case UIDeviceBatteryStateUnplugged:
+      return @"unplugged";
+    default:
+      return @"unknown";
+  }
+}
+
+- (NSString *)fontsDigest
+{
+  CC_SHA256_CTX ctx;
+  CC_SHA256_Init(&ctx);
+  for (NSString *family in [[UIFont familyNames] sortedArrayUsingSelector:@selector(compare:)]) {
+    NSData *familyData = [family dataUsingEncoding:NSUTF8StringEncoding];
+    CC_SHA256_Update(&ctx, familyData.bytes, (CC_LONG)familyData.length);
+    for (NSString *name in [[UIFont fontNamesForFamilyName:family] sortedArrayUsingSelector:@selector(compare:)]) {
+      NSData *nameData = [name dataUsingEncoding:NSUTF8StringEncoding];
+      CC_SHA256_Update(&ctx, nameData.bytes, (CC_LONG)nameData.length);
+    }
+  }
+  unsigned char digest[CC_SHA256_DIGEST_LENGTH];
+  CC_SHA256_Final(digest, &ctx);
+  NSMutableString *hex = [NSMutableString stringWithCapacity:CC_SHA256_DIGEST_LENGTH * 2];
+  for (int i = 0; i < CC_SHA256_DIGEST_LENGTH; i++) {
+    [hex appendFormat:@"%02x", digest[i]];
+  }
+  return hex;
+}
+
+@end

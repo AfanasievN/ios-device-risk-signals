@@ -1,0 +1,90 @@
+#import "GeolocationInfoProvider.h"
+#import "CollectionThreadPolicy.h"
+#import <CoreLocation/CoreLocation.h>
+
+@implementation GeolocationInfoProvider
+
+- (NSDictionary *)geolocationSignals
+{
+  RNDIRequireMainThread();
+  NSMutableDictionary *result = [NSMutableDictionary dictionary];
+
+  // Core Location needs an active run loop. The caller supplies main-thread execution.
+  void (^work)(void) = ^{
+    [self collectInto:result];
+  };
+  work();
+  return result;
+}
+
+- (void)collectInto:(NSMutableDictionary *)result
+{
+  CLLocationManager *manager = [[CLLocationManager alloc] init];
+
+  CLAuthorizationStatus status;
+  if (@available(iOS 14.0, *)) {
+    status = manager.authorizationStatus;
+  } else {
+    status = [CLLocationManager authorizationStatus];
+  }
+  result[@"authorizationStatus"] = [self statusString:status];
+  result[@"locationServicesEnabled"] = @([CLLocationManager locationServicesEnabled]);
+
+  BOOL authorized = (status == kCLAuthorizationStatusAuthorizedAlways ||
+                     status == kCLAuthorizationStatusAuthorizedWhenInUse);
+  result[@"hasCoarsePermission"] = @(authorized);
+  // gnssSupported intentionally OMITTED on iOS. The only cheap analogue,
+  // +[CLLocationManager locationServicesEnabled], reports the user's system-wide Location Services
+  // TOGGLE, not GNSS-hardware presence — reporting it here would make a genuine user who disabled
+  // Location Services look like an emulator (false tell) and disagree with Android's
+  // hasSystemFeature(FEATURE_LOCATION_GPS) semantics. Optional field ⇒ omission reads as "not observed".
+
+  if (authorized) {
+    // Cached last-known fix only — reading .location never prompts and never starts updates.
+    CLLocation *location = manager.location;
+    if (location != nil) {
+      result[@"latitude"] = @(location.coordinate.latitude);
+      result[@"longitude"] = @(location.coordinate.longitude);
+      if (location.horizontalAccuracy >= 0) {
+        result[@"accuracyMeters"] = @(location.horizontalAccuracy);
+      }
+      if (location.verticalAccuracy >= 0) {
+        result[@"altitudeMeters"] = @(location.altitude);
+      }
+      if (@available(iOS 15.0, *)) {
+        CLLocationSourceInformation *source = location.sourceInformation;
+        if (source != nil) {
+          result[@"isSimulatedBySoftware"] = @(source.isSimulatedBySoftware);
+          result[@"isProducedByAccessory"] = @(source.isProducedByAccessory);
+        }
+      }
+      NSTimeInterval age = -[location.timestamp timeIntervalSinceNow];
+      if (age >= 0) {
+        // 64-bit on purpose, matching the Kotlin Long: a 32-bit millisecond age wraps past
+        // ~24.86 days, which a long-cached fix or a backwards device clock reaches routinely.
+        // NSInteger is already 64-bit on every supported (arm64) iOS target; int64_t says so.
+        result[@"locationAgeMs"] = @((int64_t)(age * 1000));
+      }
+    }
+  }
+}
+
+- (NSString *)statusString:(CLAuthorizationStatus)status
+{
+  switch (status) {
+    case kCLAuthorizationStatusNotDetermined:
+      return @"notDetermined";
+    case kCLAuthorizationStatusRestricted:
+      return @"restricted";
+    case kCLAuthorizationStatusDenied:
+      return @"denied";
+    case kCLAuthorizationStatusAuthorizedAlways:
+      return @"authorizedAlways";
+    case kCLAuthorizationStatusAuthorizedWhenInUse:
+      return @"authorizedWhenInUse";
+    default:
+      return @"unknown";
+  }
+}
+
+@end
